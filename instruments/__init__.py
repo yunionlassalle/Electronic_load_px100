@@ -50,6 +50,7 @@ class Instruments:
                 if driver.probe():
                     self.instruments.append(driver)
                     print("found " + driver.name)
+                    return
                 else:
                     print("ko")
                     resource.close()

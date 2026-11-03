@@ -1,0 +1,3 @@
+Repositorio: https://github.com/misdoro/Electronic_load_px100
+Revision del codigo: a8df111
+Fecha de revision: 2026-08-03

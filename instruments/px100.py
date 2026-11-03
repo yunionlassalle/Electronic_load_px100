@@ -124,7 +124,8 @@ class PX100(Instrument):
     def readAll(self):
         # Add validation to ensure we don't return invalid data
         try:
-            self.update_vals(PX100.FREQ_VALS)
+            if not self.update_vals(PX100.FREQ_VALS):
+                return None
 
             # Validate critical values before returning
             voltage = self.data.get('voltage')
@@ -141,17 +142,24 @@ class PX100(Instrument):
                 return None  # Return None for invalid data
 
         except Exception as e:
-            # Don't spam errors, just return None
+            self._read_error_count = getattr(self, '_read_error_count', 0) + 1
+            if self._read_error_count % 20 == 1:
+                print(f'Read error ({self._read_error_count}): {type(e).__name__}: {e}', flush=True)
             return None
 
     def update_vals(self, keys):
+        success = True
         for key in keys:
-            self.update_val(key)
+            if not self.update_val(key):
+                success = False
+        return success
 
     def update_val(self, key):
         value = self.getVal(PX100.KEY_CMDS[key])
-        if (value is not False):
-            self.data[key] = value
+        if value is False:
+            return False
+        self.data[key] = value
+        return True
 
     def command(self, command, value):
         if command not in (PX100.COMMANDS.keys()):

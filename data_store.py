@@ -17,6 +17,7 @@ class DataStore:
         self.data = DataFrame()
 
     def append(self, row):
+        print("readAll", row, flush=True)
         # Only log on state changes or significant events to reduce terminal spam
         current_time = datetime.now()
         should_log = False

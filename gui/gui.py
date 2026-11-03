@@ -7,7 +7,8 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, time
 from PySide6.QtWidgets import QPushButton, QMessageBox
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QRegularExpressionValidator, QAction
+from PySide6.QtCore import QRegularExpression
 
 matplotlib.use('QtAgg')
 
@@ -19,6 +20,7 @@ from PySide6.QtCore import (
     QSize,
     QPoint,
     QTimer,
+    QTime,
 )
 
 from PySide6.QtWidgets import (
@@ -66,8 +68,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ui.setupUi(self)
         for name, value in vars(self.ui).items():
             setattr(self, name, value)
+        self.cellLabel.setMaxLength(20)
+        self.cellLabel.setValidator(QRegularExpressionValidator(
+            QRegularExpression(r'[^<>:"/\\|?*\x00-\x1f]*'), self.cellLabel))
+        self.cellLabel.setToolTip('Nombre para los archivos; evita caracteres no admitidos por Windows')
+        self.cellLabel.editingFinished.connect(self.normalize_label)
+        self.cellLabel.setMinimumWidth(180)
         self.load_settings()
+        self.setup_step_controls()
 
+        self._console_auto_hidden = False
+        self._console_visible = True
         self.plot_placeholder.setLayout(self.plot_layout())
         self.map_controls()
         self.tab2 = QtWidgets.QWidget()
@@ -110,6 +121,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Group the control buttons together at the end
         self.controlsLayout.addWidget(self.start_test_button)
         self.controlsLayout.addWidget(self.resetButton)
+        self.save_trial_button = QPushButton("Guardar prueba")
+        self.save_trial_button.setToolTip("Guardar lecturas y grafica con nombre unico, sin detener la prueba")
+        self.save_trial_button.clicked.connect(self.save_trial)
+        self.controlsLayout.addWidget(self.save_trial_button)
         self.controlsLayout.addWidget(self.send_email_button)
 
         self.tab2.layout().addWidget(self.logControl, 0, 0)
@@ -120,16 +135,141 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_autosave_time = None
         self.show()
 
+    def normalize_label(self):
+        import re
+        value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', self.cellLabel.text()).strip().rstrip('. ')
+        if re.match(r'^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)', value, re.I):
+            value = '_' + value
+        self.cellLabel.setText(value[:20])
+
+    def _console_handle(self):
+        if os.name != 'nt':
+            return None
+        import ctypes
+        return ctypes.windll.kernel32.GetConsoleWindow()
+
+    def _update_log_button(self):
+        self.logs_button.setEnabled(bool(self._console_handle()))
+        text = 'Ocultar logs' if self._console_visible else 'Mostrar logs'
+        self.logs_button.setText(text)
+        self.logs_button.setToolTip(text)
+
+    def set_logs_visible(self, visible):
+        handle = self._console_handle()
+        if handle:
+            import ctypes
+            ctypes.windll.user32.ShowWindow(handle, 5 if visible else 0)
+            self._console_visible = visible
+        self._update_log_button()
+
+    def toggle_logs(self):
+        self.set_logs_visible(not self._console_visible)
+
+    def setup_step_controls(self):
+        settings = QSettings()
+        for row, field, unit, key in (
+                (0, self.set_voltage, 'V', 'voltage'),
+                (1, self.set_current, 'A', 'current')):
+            self.formLayout.removeWidget(field)
+            container = QtWidgets.QWidget(self.ranges)
+            layout = QtWidgets.QHBoxLayout(container)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(field)
+            selector = QtWidgets.QComboBox(container)
+            selector.setObjectName(key + '_step')
+            selector.setToolTip('Paso de ajuste con las flechas')
+            for step in (0.01, 0.1, 1.0):
+                selector.addItem(f'{step:.2f} {unit}', step)
+            field.setStepType(QtWidgets.QAbstractSpinBox.StepType.DefaultStepType)
+            saved = settings.value('Steps/' + key, 0.1, type=float)
+            index = selector.findData(saved)
+            selector.setCurrentIndex(index if index >= 0 else 1)
+            field.setSingleStep(selector.currentData())
+            selector.currentIndexChanged.connect(
+                lambda _, f=field, c=selector: f.setSingleStep(c.currentData()))
+            layout.addWidget(selector)
+            self.formLayout.setWidget(row, QtWidgets.QFormLayout.ItemRole.FieldRole, container)
+            setattr(self, key + '_step', selector)
+
+    def save_trial(self):
+        self.normalize_label()
+        data = self.backend.datastore.data.copy(deep=True)
+        if data.empty:
+            QMessageBox.information(self, 'Guardar prueba', 'Todavia no hay lecturas para guardar.')
+            return
+        try:
+            from trial_export import export_trial
+            files = export_trial(
+                data, self.canvas.fig, self.cellLabel.text(),
+                Path(self.logControl.full_path) / 'logs',
+                self.internal_r.tableModel._data.copy(deep=True))
+        except Exception as exc:
+            QMessageBox.critical(self, 'Error al guardar', str(exc))
+            return
+        print('Prueba guardada: ' + ', '.join(str(f) for f in files), flush=True)
+        QMessageBox.information(self, 'Prueba guardada',
+                                '\n'.join(str(f) for f in files))
+
     def plot_layout(self):
         self.canvas = MplCanvas(self, width=8, height=4, dpi=100)
         self.ax = self.canvas.axes
         self.twinax = self.ax.twinx()
 
         toolbar = NavigationToolbar(self.canvas, self)
+        self.plot_toolbar = toolbar
+        self._plot_manual_view = False
+        self._plot_updating = False
+        self.ax.callbacks.connect('xlim_changed', self._plot_view_changed)
+        self.ax.callbacks.connect('ylim_changed', self._plot_view_changed)
+        self.twinax.callbacks.connect('ylim_changed', self._plot_view_changed)
+        toolbar._actions['home'].triggered.connect(self._plot_auto_view)
+        self.voltage_line, = self.ax.plot([], [], label='voltage')
+        self.current_line, = self.twinax.plot([], [], 'r', label='current')
+        self.ax.set_xlabel('Elapsed time, s')
+        self.ax.set_ylabel('Voltage, V')
+        self.twinax.yaxis.set_label_position('right')
+        self.twinax.yaxis.tick_right()
+        self.twinax.set_ylabel('Current, A')
+        self.ax.legend(loc='center left')
+        self.twinax.legend(loc='center right')
+        icon = self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_ComputerIcon)
+        self.logs_button = QAction(icon, 'Ocultar logs', toolbar)
+        self.logs_button.triggered.connect(self.toggle_logs)
+        toolbar.insertAction(toolbar._actions['save_figure'], self.logs_button)
+        self._update_log_button()
         layout = QVBoxLayout()
         layout.addWidget(toolbar)
         layout.addWidget(self.canvas)
         return layout
+
+    def _plot_view_changed(self, _axis):
+        if not self._plot_updating:
+            self._plot_manual_view = True
+
+    def _plot_auto_view(self):
+        self._plot_manual_view = False
+        if hasattr(self, 'backend') and self.backend.datastore:
+            self._refresh_plot(self.backend.datastore)
+
+    def _refresh_plot(self, data):
+        frame = data.data
+        if frame.empty:
+            return
+        self._plot_updating = True
+        try:
+            self.voltage_line.set_data(frame['time'], frame['voltage'])
+            self.current_line.set_data(frame['time'], frame['current'])
+            if not self._plot_manual_view:
+                self.ax.relim()
+                self.ax.autoscale(enable=True, axis='both')
+                self.ax.autoscale_view()
+                self.twinax.relim()
+                self.twinax.autoscale(enable=True, axis='y')
+                self.twinax.autoscale_view(scalex=False, scaley=True)
+                # Keep a useful range for an otherwise constant series.
+            self.canvas.draw_idle()
+        finally:
+            self._plot_updating = False
 
     def map_controls(self):
         self.set_voltage.valueChanged.connect(self.voltage_changed)
@@ -145,16 +285,28 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def data_row(self, data, row):
         if data:
+            if not self._console_auto_hidden:
+                worker = getattr(self.backend, 'instr_worker', None)
+                instrument = getattr(worker, 'instr', None)
+                if instrument is not None and getattr(instrument, 'port', None) != 'SIM':
+                    self.set_logs_visible(False)
+                    self._console_auto_hidden = True
             # Track last successful data time
             self.last_data_time = datetime.now()
 
             set_voltage = data.lastval('set_voltage')
-            if not self.set_voltage.hasFocus():
+            if not self.set_voltage.hasFocus() and not self.set_voltage_timer.isActive():
                 self.set_voltage.setValue(set_voltage)
 
             set_current = data.lastval('set_current')
-            if not self.set_current.hasFocus():
+            if not self.set_current.hasFocus() and not self.set_current_timer.isActive():
                 self.set_current.setValue(set_current)
+
+            set_timer = data.lastval('set_timer')
+            if not self.set_timer.hasFocus():
+                old_blocked = self.set_timer.blockSignals(True)
+                self.set_timer.setTime(QTime(set_timer.hour, set_timer.minute, set_timer.second))
+                self.set_timer.blockSignals(old_blocked)
 
             is_on = data.lastval('is_on')
             if is_on != self.test_running:
@@ -177,19 +329,7 @@ class MainWindow(QtWidgets.QMainWindow):
             elapsed_seconds = data.lastval('time')
             self.readTime.setText(self._format_duration(elapsed_seconds))
 
-            xlim = (0, max(60, elapsed_seconds))
-            self.ax.cla()
-            self.twinax.cla()
-            data.plot(ax=self.ax, x='time', y=['voltage'], xlim=xlim)
-            self.ax.legend(loc='center left')
-            self.ax.set_xlabel('Elapsed time, s')
-            self.ax.set_ylabel('Voltage, V')
-            self.ax.set_ylim(bottom=set_voltage)
-            data.plot(ax=self.twinax, x='time', y=['current'], style='r')
-            self.twinax.legend(loc='center right')
-            self.twinax.set_ylabel('Current, A')
-            self.twinax.set_ylim(0, 10)
-            self.canvas.draw()
+            self._refresh_plot(data)
 
             # Check if test has just completed (device turned off)
             if 'is_on' in row and not row['is_on'] and hasattr(self, 'prev_is_on') and self.prev_is_on:
@@ -270,6 +410,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.swCCCV.reset()
         self.internal_r.reset()
         self.backend.datastore.reset()
+        self._plot_manual_view = False
         self.backend.send_command({Instrument.COMMAND_RESET: 0.0})
         self.email_sent = False
         self.last_autosave_time = None
@@ -357,7 +498,8 @@ The test data files and plot are attached.
                 print("No attachments available, skipping email")
 
     def _log_context(self):
-        cell_label = self.cellLabel.text().replace(" ", "_")
+        self.normalize_label()
+        cell_label = self.cellLabel.text().replace(" ", "_") or 'Prueba'
         base_path = self.logControl.full_path
         log_path = os.path.join(base_path, "logs")
         try:
@@ -401,6 +543,8 @@ The test data files and plot are attached.
     def save_settings(self):
         settings = QSettings()
 
+        settings.setValue('Steps/voltage', self.voltage_step.currentData())
+        settings.setValue('Steps/current', self.current_step.currentData())
         settings.setValue("MainWindow/size", self.size())
         settings.setValue("MainWindow/pos", self.pos())
         settings.setValue("MainWindow/cellLabel", self.cellLabel.text())
