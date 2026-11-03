@@ -18,3 +18,7 @@ Esta copia deriva de [misdoro/Electronic_load_px100](https://github.com/misdoro/
 Abrir PX100.cmd usa el entorno .venv local. No subir .venv, backups, archivos personales ni datos de pruebas al repositorio. Revisar antes de publicar para evitar compartir credenciales, ajustes o datos privados. Software CC-CV puede modificar la corriente y debe desactivarse para control manual. El uso del temporizador con la DL24 real sigue pendiente de comprobar. Cambios probados parcialmente con lecturas simuladas; verificar cada función con el equipo antes de depender de ella.
 
 El fork de Jay2k1 es otro proyecto preparado aparte para comparación, no se han incorporado sus funciones automáticamente.
+
+## Interfaz inspirada en Jay2k1
+
+Se incorpora la presentación de gráficas y lecturas de [Jay2k1/Electronic_load_DL24](https://github.com/Jay2k1/Electronic_load_DL24), GPL-3.0: colores, ejes adicionales, leyenda conjunta inferior izquierda y título. Potencia calculada como V por A y temperatura recibida del equipo, con gráficas opcionales. Ah blanco y Wh amarillo sobre negro. Se vuelve al redibujado completo de Jay2k1 para evaluar esta interfaz; el zoom durante adquisición sigue pendiente de revisión.

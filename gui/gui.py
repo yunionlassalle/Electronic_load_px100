@@ -76,6 +76,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cellLabel.setMinimumWidth(180)
         self.load_settings()
         self.setup_step_controls()
+        self.setup_jay_readings()
 
         self._console_auto_hidden = False
         self._console_visible = True
@@ -116,6 +117,15 @@ class MainWindow(QtWidgets.QMainWindow):
         """)
 
         # Add other widgets first
+        self.extra_graphs = QtWidgets.QGroupBox('Additional graphs')
+        graph_layout = QtWidgets.QVBoxLayout(self.extra_graphs)
+        self.checkbox_p = QtWidgets.QCheckBox('Power')
+        self.checkbox_t = QtWidgets.QCheckBox('MOSFET Temperature')
+        for checkbox in (self.checkbox_p, self.checkbox_t):
+            checkbox.setChecked(True)
+            graph_layout.addWidget(checkbox)
+            checkbox.toggled.connect(self.refresh_graph_options)
+        self.controlsLayout.insertWidget(1, self.extra_graphs)
         self.controlsLayout.addWidget(self.internal_r)
 
         # Group the control buttons together at the end
@@ -217,21 +227,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         toolbar = NavigationToolbar(self.canvas, self)
         self.plot_toolbar = toolbar
-        self._plot_manual_view = False
-        self._plot_updating = False
-        self.ax.callbacks.connect('xlim_changed', self._plot_view_changed)
-        self.ax.callbacks.connect('ylim_changed', self._plot_view_changed)
-        self.twinax.callbacks.connect('ylim_changed', self._plot_view_changed)
-        toolbar._actions['home'].triggered.connect(self._plot_auto_view)
-        self.voltage_line, = self.ax.plot([], [], label='voltage')
-        self.current_line, = self.twinax.plot([], [], 'r', label='current')
-        self.ax.set_xlabel('Elapsed time, s')
-        self.ax.set_ylabel('Voltage, V')
-        self.twinax.yaxis.set_label_position('right')
-        self.twinax.yaxis.tick_right()
-        self.twinax.set_ylabel('Current, A')
-        self.ax.legend(loc='center left')
-        self.twinax.legend(loc='center right')
+        self.twinaxPower = self.ax.twinx()
+        self.twinaxTemp = self.ax.twinx()
         icon = self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_ComputerIcon)
         self.logs_button = QAction(icon, 'Ocultar logs', toolbar)
         self.logs_button.triggered.connect(self.toggle_logs)
@@ -242,34 +239,85 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.canvas)
         return layout
 
-    def _plot_view_changed(self, _axis):
-        if not self._plot_updating:
-            self._plot_manual_view = True
+    def setup_jay_readings(self):
+        # Presentation inspired by Jay2k1/Electronic_load_DL24 (GPL-3.0).
+        self.readPower = QtWidgets.QLabel('0.000 W')
+        self.readTemp = QtWidgets.QLabel('0 C / 32 F')
+        form = self.formLayout_2
+        while form.count():
+            item = form.takeAt(0)
+            if item.widget():
+                item.widget().hide()
+        rows = (
+            ('Voltage', self.readVoltage, 'blue', 'white'),
+            ('Current', self.readCurrent, 'red', 'white'),
+            ('Power', self.readPower, 'green', 'white'),
+            ('MOSFET Temp.', self.readTemp, 'grey', 'white'),
+            ('Capacity (Ah)', self.readCapAH, 'black', 'white'),
+            ('Energy (Wh)', self.readCapWH, 'black', '#ffe066'),
+            ('Time', self.readTime, 'black', 'white'))
+        for title, field, background, foreground in rows:
+            label = QtWidgets.QLabel(title)
+            form.addRow(label, field)
+            field.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            field.setStyleSheet(f'background-color: {background}; color: {foreground}; '
+                               'border-radius: 4px; padding: 2px 6px; '
+                               'font-family: "Courier New"; font-size: 18px;')
+            field.show()
 
-    def _plot_auto_view(self):
-        self._plot_manual_view = False
+    def refresh_graph_options(self):
         if hasattr(self, 'backend') and self.backend.datastore:
             self._refresh_plot(self.backend.datastore)
 
     def _refresh_plot(self, data):
+        from matplotlib.ticker import FormatStrFormatter, FuncFormatter
         frame = data.data
         if frame.empty:
             return
-        self._plot_updating = True
-        try:
-            self.voltage_line.set_data(frame['time'], frame['voltage'])
-            self.current_line.set_data(frame['time'], frame['current'])
-            if not self._plot_manual_view:
-                self.ax.relim()
-                self.ax.autoscale(enable=True, axis='both')
-                self.ax.autoscale_view()
-                self.twinax.relim()
-                self.twinax.autoscale(enable=True, axis='y')
-                self.twinax.autoscale_view(scalex=False, scaley=True)
-                # Keep a useful range for an otherwise constant series.
-            self.canvas.draw_idle()
-        finally:
-            self._plot_updating = False
+        for axis in (self.ax, self.twinax, self.twinaxPower, self.twinaxTemp):
+            axis.cla()
+            axis.get_yaxis().set_visible(True)
+        self.ax.set_title(self.cellLabel.text() + ' (' + datetime.now().strftime('%Y-%m-%d') + ')')
+        self.ax.plot(frame['time'], frame['voltage'], color='blue', label='voltage')
+        self.twinax.plot(frame['time'], frame['current'], color='red', label='current')
+        self.ax.set_xlim(0, max(60, float(frame['time'].max())))
+        self.ax.set_ylim(bottom=data.lastval('set_voltage'))
+        self.twinax.set_ylim(bottom=0)
+        self.ax.yaxis.tick_left()
+        self.ax.tick_params(axis='y', colors='blue')
+        self.twinax.yaxis.tick_right()
+        self.twinax.tick_params(axis='y', colors='red')
+        self.ax.yaxis.set_major_formatter(FormatStrFormatter('%.1fV'))
+        self.twinax.yaxis.set_major_formatter(FormatStrFormatter('%.1fA'))
+        self.ax.xaxis.set_major_formatter(FuncFormatter(lambda value, _: self._format_duration(value)))
+        self.ax.set_xlabel('time')
+        if self.checkbox_p.isChecked():
+            self.twinaxPower.spines['right'].set_position(('axes', 1.1))
+            self.twinaxPower.plot(frame['time'], frame['power'], color='green', label='power')
+            self.twinaxPower.set_ylim(bottom=0)
+            self.twinaxPower.yaxis.tick_right()
+            self.twinaxPower.tick_params(axis='y', colors='green')
+            self.twinaxPower.yaxis.set_major_formatter(FormatStrFormatter('%.1f W'))
+        else:
+            self.twinaxPower.get_yaxis().set_visible(False)
+            self.twinaxPower.spines['right'].set_visible(False)
+        if self.checkbox_t.isChecked():
+            self.twinaxTemp.spines['left'].set_position(('axes', -0.1))
+            self.twinaxTemp.plot(frame['time'], frame['temp'], color='grey', label='temp')
+            self.twinaxTemp.set_ylim(bottom=20)
+            self.twinaxTemp.yaxis.tick_left()
+            self.twinaxTemp.tick_params(axis='y', colors='grey')
+            self.twinaxTemp.yaxis.set_major_formatter(FormatStrFormatter('%.0f°'))
+        else:
+            self.twinaxTemp.get_yaxis().set_visible(False)
+            self.twinaxTemp.spines['left'].set_visible(False)
+        lines, labels = [], []
+        for axis in (self.ax, self.twinax, self.twinaxPower, self.twinaxTemp):
+            handles, names = axis.get_legend_handles_labels()
+            lines.extend(handles); labels.extend(names)
+        self.ax.legend(lines, labels, loc='lower left')
+        self.canvas.fig.tight_layout()
+        self.canvas.draw()
 
     def map_controls(self):
         self.set_voltage.valueChanged.connect(self.voltage_changed)
@@ -329,6 +377,9 @@ class MainWindow(QtWidgets.QMainWindow):
             elapsed_seconds = data.lastval('time')
             self.readTime.setText(self._format_duration(elapsed_seconds))
 
+            self.readPower.setText(f"{voltage * current:5.3f} W")
+            temperature = data.lastval('temp')
+            self.readTemp.setText(f"{temperature:.0f}°C / {temperature * 1.8 + 32:.0f}°F")
             self._refresh_plot(data)
 
             # Check if test has just completed (device turned off)
@@ -410,7 +461,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.swCCCV.reset()
         self.internal_r.reset()
         self.backend.datastore.reset()
-        self._plot_manual_view = False
         self.backend.send_command({Instrument.COMMAND_RESET: 0.0})
         self.email_sent = False
         self.last_autosave_time = None
